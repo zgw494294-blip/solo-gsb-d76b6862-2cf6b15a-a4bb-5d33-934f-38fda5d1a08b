@@ -88,6 +88,7 @@ function scheduleSolve(delay = 200) {
   markCycleStaleness();
   markExtractStaleness();
   markMergeStaleness();
+  markChainStaleness();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -535,6 +536,14 @@ function showErrors(errors) {
   elResultBody.innerHTML = `<div class="result-empty">修正输入后将自动重新计算。</div>`;
   $("#inferCard").hidden = true;
   $("#mergeCard").hidden = true;
+  // 输入非法期间没有有效求解顺序：校准链卡片一并隐藏，旧方案不得在恢复后被确认
+  elChainCard.hidden = true;
+  chainState.plan = null;
+  chainState.planKey = "";
+  chainState.invalidated = false;
+  elChainResult.innerHTML = "";
+  elChainErrors.hidden = true;
+  markChainStaleness();
 }
 
 // ------------------------------------------------------------ 结果渲染 --
@@ -583,6 +592,7 @@ function renderResult(r) {
   syncInferPanel(r);
   syncTransitionPanel(r);
   syncMergePanel(r);
+  syncChainPanel(r);
 }
 
 function renderSample(s) {
@@ -989,6 +999,38 @@ document.addEventListener("change", (e) => {
     mergeState.upperId = t.value;
     markMergeStaleness();
     updateMergeRunHint();
+  } else if (act === "chain-type") {
+    const step = chainState.steps[Number(t.dataset.step)];
+    if (step.type !== t.value) {
+      step.type = t.value;
+      // 切换类型时按新类型初始化字段（旧类型字段不沿用）：
+      // infer 需 1～2 个待调 ID（默认当前有效顺序最底层），merge 需下 / 上层 ID
+      if (t.value === "infer") {
+        step.adjustIds = [chainDefaultAdjustId()];
+        delete step.lowerId;
+        delete step.upperId;
+      } else {
+        const order =
+          lastSolveResult && lastSolveEpoch === solveInputEpoch ? lastSolveResult.order : [];
+        step.lowerId = order.length >= 2 ? order[order.length - 2] : "";
+        step.upperId = order.length >= 1 ? order[order.length - 1] : "";
+        delete step.adjustIds;
+      }
+    }
+    renderChainControls();
+  } else if (act === "chain-infer-id") {
+    const k = Number(t.dataset.idx);
+    const step = chainState.steps[Number(t.dataset.step)];
+    step.adjustIds[k] = t.value;
+    // 规整待调数组：去掉「（不选）」空值并按槽位顺序紧凑（保留 1～2 个非空 ID）
+    step.adjustIds = step.adjustIds.filter(Boolean);
+    renderChainControls();
+  } else if (act === "chain-merge-lower") {
+    chainState.steps[Number(t.dataset.step)].lowerId = t.value;
+    renderChainControls();
+  } else if (act === "chain-merge-upper") {
+    chainState.steps[Number(t.dataset.step)].upperId = t.value;
+    renderChainControls();
   }
 });
 
@@ -1019,6 +1061,16 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "cycle-confirm") confirmCyclePlan();
   if (btn.dataset.act === "merge-run") runMerge();
   if (btn.dataset.act === "merge-confirm") confirmMergePlan();
+  if (btn.dataset.act === "chain-run") void runChain();
+  if (btn.dataset.act === "chain-confirm") confirmChainPlan();
+  if (btn.dataset.act === "chain-add" && chainState.steps.length < MAX_CHAIN_STEPS) {
+    chainState.steps.push({ type: "infer", adjustIds: [chainDefaultAdjustId()] });
+    renderChainControls();
+  }
+  if (btn.dataset.act === "chain-remove" && chainState.steps.length > MIN_CHAIN_STEPS) {
+    chainState.steps.splice(Number(btn.dataset.step), 1);
+    renderChainControls();
+  }
 });
 
 // 反推请求的登记、归属检查与加载收尾统一走共享通道 inferChannel
@@ -1186,6 +1238,7 @@ function applyInferResult() {
   markCycleStaleness();
   markTransitionStaleness();
   markMergeStaleness();
+  markChainStaleness();
   runSolve();
 }
 
@@ -1497,10 +1550,480 @@ function confirmMergePlan() {
   markTransitionStaleness();
   markExtractStaleness();
   markMergeStaleness();
+  markChainStaleness();
   runSolve();
 }
 
-// ============================================================ 过渡步骤规划 ==
+// ============================================================ 校准处理链（反推 + 同色合并） ==
+//
+// 把不透明度反推与相邻同色合并组合成一条可整批确认的校准处理链：页面用当前
+// 有效求解顺序录入 1～4 步，每步要么指定 1～2 个待调 ID 做不透明度反推，要么
+// 指定下、上层 ID 做相邻同色合并。整批试算请求携带完整校准输入、完整合法初始
+// 顺序与全部步骤，服务端在副本上沿用原反推网格与合并计算、校验规则依次执行：
+// 后一步使用前一步的新参数、图层、关系和顺序，不重新择序；合并删去的 ID 在
+// 后续步骤再引用会按当时图层集合报错，不自动改指向保留层。
+//
+// 任何一步失败都注明步号、不返回可确认方案，页面原输入始终不变；全部成功后
+// 「确认」才可点击。确认时一次性写回最终输入（只写最终输入，中间试算结果不
+// 作为其他功能的有效结果）并重新求解：旧调序执行终止（已确认记录保留）。
+//
+// 失效与请求竞态规则（与合并 / 反推同样严格）：
+//  - 参与输入：图层、样本、关系、当前有效求解顺序与全部步骤。方案展示后任一
+//    变化即永久作废（invalidated 一旦置位不复位，改回原值也不恢复确认资格）；
+//    在途请求同样立即作废并结束加载态，等待试算时「确认」保持禁用。
+//  - 请求序号取自永不归零的单调计数器；连续试算只接纳「最近一次且输入未变」
+//    的响应，过期响应无论成功、HTTP 错误、连接异常还是解析失败都直接丢弃，
+//    不改动方案、错误提示或较新请求的加载状态。
+//  - 方案一经确认即被消费：清空后重复确认不得再次写回。
+const MIN_CHAIN_STEPS = 1, MAX_CHAIN_STEPS = 4;
+
+const chainState = {
+  steps: [],          // [{type:"infer", adjustIds:[id, id?]}, {type:"merge", lowerId, upperId}]
+  plan: null,         // 最近一次成功返回的待确认校准链结果
+  planKey: "",        // 方案产生时的参与输入指纹
+  invalidated: false, // 方案展示后参与输入是否曾变化：一旦置位，改回原值也不恢复
+  // 在途请求登记、归属检查与加载收尾由共享通道 chainChannel 管理（见 request-channel.js）
+};
+
+const elChainCard = $("#chainCard");
+const elChainOrder = $("#chainOrder");
+const elChainSteps = $("#chainSteps");
+const elChainRunBtn = $("#chainRunBtn");
+const elChainAddBtn = $("#chainAddBtn");
+const elChainHint = $("#chainHint");
+const elChainErrors = $("#chainErrors");
+const elChainResult = $("#chainResult");
+const elChainStatus = $("#chainStatus");
+
+// 校准链请求通道：归属键＝参与输入指纹（chainSignature，含图层 / 样本 / 关系 /
+// 当前有效求解顺序 / 全部步骤）：校准输入、求解顺序或步骤变化都会使指纹偏离
+// 在途登记键；指纹不会回到旧值，改回原值也不能复活旧请求。
+const chainChannel = new RequestChannel({
+  onLoadingChange: (busy) => {
+    if (!busy) {
+      elChainStatus.textContent = "";
+      elChainStatus.className = "status";
+    }
+    updateChainRunHint();
+  },
+});
+
+function chainSignature() {
+  // 图层 / 样本 / 关系、当前有效求解顺序（无有效求解时记为空，方案必然失配）
+  // 与全部步骤共同决定方案身份；这些对象的任何编辑都会改变序列化结果，
+  // 且随着求解输入纪元只增不减，改回原值也不会回到旧指纹。
+  return JSON.stringify({
+    epoch: solveInputEpoch,
+    layers: state.layers,
+    samples: state.samples,
+    relations: state.relations,
+    order: lastSolveResult && lastSolveEpoch === solveInputEpoch ? lastSolveResult.order : [],
+    steps: chainState.steps,
+  });
+}
+
+// 新建 infer 步骤时的默认待调 ID：当前有效顺序最底层；无有效顺序时取第一个图层
+function chainDefaultAdjustId() {
+  const order = lastSolveResult && lastSolveEpoch === solveInputEpoch ? lastSolveResult.order : [];
+  return order[0] || (state.layers[0] && state.layers[0].id) || "";
+}
+
+function syncChainPanel(solveResult) {
+  elChainCard.hidden = false;
+  if (!chainState.steps.length) {
+    chainState.steps = [{ type: "infer", adjustIds: [solveResult.order[0]] }];
+  }
+  renderChainOrder(solveResult.order);
+  renderChainControls();
+}
+
+function renderChainOrder(order) {
+  elChainOrder.innerHTML = "";
+  order.forEach((id, pos) => {
+    const layer = layerById(id);
+    const hex = (layer && normalizeHex(layer.color)) || "#000000";
+    const op = layer && Number.isFinite(layer.opacity) ? layer.opacity : 1;
+    const slot = document.createElement("span");
+    slot.className = "order-slot";
+    slot.innerHTML = `
+      <span class="mini-dot" style="background:${hexToRgba(hex, op)}"></span>
+      <span class="slot-id">${escapeHtml(id)}</span>
+      <span class="mini-op">α=${Number(op.toFixed(2))}</span>
+    `;
+    elChainOrder.appendChild(slot);
+    if (pos < order.length - 1) {
+      const ar = document.createElement("span");
+      ar.className = "infer-arrow";
+      ar.textContent = "↑";
+      elChainOrder.appendChild(ar);
+    }
+  });
+}
+
+// 步骤配置中的 ID 选项始终取【当前校准输入】图层：已被前面步骤在副本中合并
+// 删去的 ID 仍会保留在选项里（页面原输入未变），由服务端在执行到该步时按
+// 当时副本报错——与「不能自动改指向保留层」的要求一致。
+function chainLayerOptions(selected) {
+  return state.layers
+    .map(
+      (l) =>
+        `<option value="${escapeHtml(l.id)}"${l.id === selected ? " selected" : ""}>${escapeHtml(
+          l.id
+        )}</option>`
+    )
+    .join("");
+}
+
+function renderChainControls() {
+  elChainSteps.innerHTML = "";
+  chainState.steps.forEach((step, k) => {
+    const row = document.createElement("div");
+    row.className = "chain-step-row";
+    let body;
+    if (step.type === "infer") {
+      const picks = [0, 1]
+        .map((slot) => {
+          const has = slot < step.adjustIds.length;
+          const val = has ? step.adjustIds[slot] : "";
+          return `
+            <label class="chain-id-pick">待调 ${slot + 1}
+              <select data-act="chain-infer-id" data-step="${k}" data-idx="${slot}">
+                <option value=""${has ? "" : " selected"}>（不选）</option>
+                ${chainLayerOptions(val)}
+              </select>
+            </label>`;
+        })
+        .join('<span class="hint">＋</span>');
+      body = `
+        <span class="chain-step-kind">不透明度反推</span>
+        ${picks}
+        <span class="hint">在 0.00～1.00（步长 0.01）网格上联合反推，其余图层保留当前值</span>`;
+    } else {
+      body = `
+        <span class="chain-step-kind">相邻同色合并</span>
+        <label class="chain-id-pick">下层
+          <select data-act="chain-merge-lower" data-step="${k}">${chainLayerOptions(step.lowerId)}</select>
+        </label>
+        <span class="relation-arrow">▲ 其上相邻叠着</span>
+        <label class="chain-id-pick">上层
+          <select data-act="chain-merge-upper" data-step="${k}">${chainLayerOptions(step.upperId)}</select>
+        </label>
+        <span class="hint">须在执行到本步时的叠序中相邻且规范化 HEX 相同</span>`;
+    }
+    row.innerHTML = `
+      <div class="chain-step-head">
+        <span class="chain-step-tag">第 ${k + 1} 步</span>
+        <select data-act="chain-type" data-step="${k}">
+          <option value="infer"${step.type === "infer" ? " selected" : ""}>不透明度反推</option>
+          <option value="merge"${step.type === "merge" ? " selected" : ""}>相邻同色合并</option>
+        </select>
+        <span class="spacer"></span>
+        <button class="btn btn-ghost btn-small" data-act="chain-remove" data-step="${k}"
+                type="button" ${chainState.steps.length <= MIN_CHAIN_STEPS ? "disabled" : ""}>删除此步</button>
+      </div>
+      <div class="chain-step-body">${body}</div>`;
+    elChainSteps.appendChild(row);
+  });
+  elChainAddBtn.disabled = chainState.steps.length >= MAX_CHAIN_STEPS;
+  updateChainRunHint();
+  markChainStaleness();
+}
+
+// 步骤配置（不发请求）的本地预检：用于禁用「整批试算」；最终判定一律以服务端为准
+function chainConfigErrors() {
+  const solveValid = lastSolveResult && lastSolveEpoch === solveInputEpoch;
+  if (!solveValid) return ["当前校准输入尚无有效求解结果，无法试算"];
+  const errs = [];
+  chainState.steps.forEach((step, k) => {
+    if (step.type === "infer") {
+      const ids = step.adjustIds.filter(Boolean);
+      if (ids.length < 1 || ids.length > 2) {
+        errs.push(`第 ${k + 1} 步：待调图层必须为 1～2 个`);
+      } else if (ids[0] === ids[1]) {
+        errs.push(`第 ${k + 1} 步：待调图层 ID 重复：${ids[0]}`);
+      }
+    } else if (!step.lowerId || !step.upperId || step.lowerId === step.upperId) {
+      errs.push(`第 ${k + 1} 步：请选择两个不同的图层（下层在下、上层在上）`);
+    }
+  });
+  return errs;
+}
+
+function updateChainRunHint() {
+  const solveValid = lastSolveResult && lastSolveEpoch === solveInputEpoch;
+  const configErrs = chainConfigErrors();
+  elChainRunBtn.disabled = !solveValid || configErrs.length > 0 || chainChannel.isBusy();
+  if (!solveValid) {
+    elChainHint.textContent = "当前校准输入尚无有效求解结果（等待重新求解 / 求解失败 / 输入非法），无法试算";
+  } else if (chainChannel.isBusy()) {
+    elChainHint.textContent = "正在整批试算…";
+  } else if (configErrs.length) {
+    elChainHint.textContent = configErrs[0];
+  } else {
+    elChainHint.textContent =
+      `将在副本上依次执行 ${chainState.steps.length} 步；任何一步失败都不返回可确认方案，原输入始终不变`;
+  }
+  // 等待试算（在途）时确认按钮同样禁用
+  const confirmBtn = elChainResult.querySelector('button[data-act="chain-confirm"]');
+  if (confirmBtn) confirmBtn.disabled = chainChannel.isBusy() || !chainPlanFresh();
+}
+
+function markChainStaleness() {
+  // 参与输入变化时：在途请求（及其响应）立即失效，不能再改动方案 / 错误 / 加载。
+  chainChannel.reap(chainSignature());
+  updateChainRunHint();
+  if (!chainState.plan) return;
+  if (chainSignature() !== chainState.planKey) chainState.invalidated = true;
+  const dead = chainState.invalidated;
+  const old = elChainResult.querySelector(".stale-note");
+  if (dead && !old) {
+    const note = document.createElement("div");
+    note.className = "stale-note";
+    note.textContent =
+      "图层、样本、关系、求解顺序或步骤已变化，以下校准链方案已作废（即使改回原值也不能再确认），请重新整批试算。";
+    elChainResult.prepend(note);
+  } else if (!dead && old) {
+    old.remove();
+  }
+  const btn = elChainResult.querySelector('button[data-act="chain-confirm"]');
+  if (btn) btn.disabled = chainChannel.isBusy() || dead;
+}
+
+// 方案是否仍对应当前输入且保有确认资格；false 时「确认」按钮不可点击
+function chainPlanFresh() {
+  return !!chainState.plan && !chainState.invalidated && chainSignature() === chainState.planKey;
+}
+
+async function runChain() {
+  // 直接调用也不得发送请求：必须有当前输入对应的有效求解顺序、步骤配置通过
+  // 本地预检，且无在途试算（最终合法性仍由服务端逐步骤判定）
+  if (!lastSolveResult || lastSolveEpoch !== solveInputEpoch) return;
+  if (chainConfigErrors().length || chainChannel.isBusy()) return;
+
+  const payload = {
+    ...buildSolvePayload(),
+    order: [...lastSolveResult.order], // 固定当前有效求解顺序为初始顺序
+    steps: chainState.steps.map((step) =>
+      step.type === "infer"
+        ? { type: "infer", adjustIds: step.adjustIds.filter(Boolean) }
+        : { type: "merge", lowerId: step.lowerId, upperId: step.upperId }
+    ),
+  };
+  const req = chainChannel.begin(chainSignature());
+
+  elChainStatus.textContent = "整批试算中…";
+  elChainStatus.className = "status busy";
+  elChainErrors.hidden = true;
+  updateChainRunHint();
+
+  try {
+    const resp = await fetch("/api/calibration-chain", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!chainChannel.owns(req.id, req.key, chainSignature())) return; // 更新请求或输入已变
+    const data = await resp.json();
+    // 响应体读取期间输入可能又变、或较新请求已发出：落地前再过一次守卫
+    if (!chainChannel.finish(req.id, req.key, chainSignature())) return;
+    if (!resp.ok) {
+      // 任何一步失败都不返回可确认方案：仅展示错误（消息已注明步号），不改任何输入
+      showChainErrors(data.errors || [{ scope: "form", message: "校准链试算失败" }]);
+      return;
+    }
+    chainState.plan = data;
+    chainState.planKey = req.key;
+    chainState.invalidated = false;
+    renderChainPlan(data);
+  } catch (err) {
+    if (!chainChannel.finish(req.id, req.key, chainSignature())) return;
+    showChainErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+  }
+}
+
+function showChainErrors(errors) {
+  elChainErrors.innerHTML =
+    "<ul>" + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elChainErrors.hidden = false;
+}
+
+// 方案渲染所需：沿初始顺序与每步变更在本地推导每步执行后的「图层 ID → 参数」
+// 快照（仅用于展示，实际写回一律以服务端返回的最终 layers/order 为准）。
+function chainSnapshots(plan) {
+  const byId = {};
+  state.layers.forEach((l) => {
+    byId[l.id] = { id: l.id, color: normalizeHex(l.color) || l.color, opacity: l.opacity };
+  });
+  const order = [...plan.initialOrder];
+  const snaps = [
+    { order: [...order], byId: new Map(Object.entries(byId).map(([k, v]) => [k, { ...v }])) },
+  ];
+  plan.steps.forEach((st) => {
+    if (st.type === "infer") {
+      st.adjustments.forEach((a) => {
+        if (byId[a.id]) byId[a.id].opacity = a.suggestedOpacity;
+      });
+    } else {
+      const keep = st.mergedLayer;
+      byId[keep.id] = { id: keep.id, color: keep.color, opacity: keep.opacity };
+      delete byId[st.removedLayer.id];
+      const p = order.indexOf(st.removedLayer.id);
+      if (p !== -1) order.splice(p, 1);
+    }
+    snaps.push({
+      order: [...order],
+      byId: new Map(Object.entries(byId).map(([k, v]) => [k, { ...v }])),
+    });
+  });
+  return snaps;
+}
+
+function renderChainOrderChips(ids, byId) {
+  return ids
+    .map((id) => {
+      const l = byId.get(id);
+      const color = l ? l.color : "#000000";
+      const op = l ? l.opacity : 1;
+      return `
+        <span class="chip">
+          <span class="dot" style="background:${hexToRgba(color, op)}" title="${escapeHtml(id)}"></span>
+          <span class="cid">${escapeHtml(id)}</span>
+          <span class="cop">α=${fmtOpacity(op)}</span>
+        </span>`;
+    })
+    .join('<span class="order-sep">↑</span>');
+}
+
+function renderChainPlan(plan) {
+  elChainErrors.hidden = true;
+  const snaps = chainSnapshots(plan);
+  const blocks = plan.steps
+    .map((st) => {
+      if (st.type === "infer") {
+        const rows = st.adjustments
+          .map((a) => {
+            const changed = Math.abs(a.originalOpacity - a.suggestedOpacity) > 1e-9;
+            return `
+              <tr>
+                <td>${escapeHtml(a.id)}</td>
+                <td class="num">${fmtOpacity(a.originalOpacity)}</td>
+                <td class="op-arrow">→</td>
+                <td class="num ${changed ? "op-new" : "op-same"}">
+                  ${fmtOpacity(a.suggestedOpacity)}${changed ? "" : "（原值即最优）"}
+                </td>
+              </tr>`;
+          })
+          .join("");
+        const delta = st.afterTotalSse - st.beforeTotalSse;
+        const deltaCls = delta < -1e-9 ? "sse-delta-down" : delta > 1e-9 ? "sse-delta-up" : "";
+        const deltaTxt =
+          Math.abs(delta) < 1e-9 ? "持平" : `${delta > 0 ? "+" : "−"}${fmtSse(Math.abs(delta))}`;
+        return `
+          <div class="chain-step-result">
+            <div class="chain-step-result-head">
+              <span class="chain-step-tag">第 ${st.step} 步 · 不透明度反推</span>
+              <span class="hint">待调：${st.adjustIds.map(escapeHtml).join("、")}</span>
+              <span class="spacer"></span>
+              <span class="hint">评估组合 ${st.combosChecked} 组</span>
+            </div>
+            <table class="adj-table">
+              <thead><tr><th>待调图层</th><th>原不透明度</th><th></th><th>建议不透明度</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+            <div class="sse-compare">
+              <span>步前总误差：<b>${fmtSse(st.beforeTotalSse)}</b></span>
+              <span class="after">步后总误差：<b>${fmtSse(st.afterTotalSse)}</b></span>
+              <span class="${deltaCls}">变化：<b>${deltaTxt}</b></span>
+            </div>
+            <div class="chain-step-order">
+              <span class="hint">步后叠序：</span>
+              <span class="checker"><span class="order-chips">
+                <span class="order-ends">底</span>${renderChainOrderChips(st.order, snaps[st.step].byId)}<span class="order-ends">↑ 顶</span>
+              </span></span>
+            </div>
+          </div>`;
+      }
+      const m = st.mergedLayer,
+        rm = st.removedLayer;
+      return `
+        <div class="chain-step-result">
+          <div class="chain-step-result-head">
+            <span class="chain-step-tag">第 ${st.step} 步 · 相邻同色合并</span>
+            <span class="mini-dot" style="background:${hexToRgba(m.color, m.opacity)}"></span>
+            <span>保留下层 <b class="hexval">${escapeHtml(m.id)}</b>，α=<b>${fmtOpacity(m.opacity)}</b>；
+              删除上层 <b class="hexval">${escapeHtml(rm.id)}</b>（原 α=${fmtOpacity(rm.opacity)}）</span>
+            <span class="spacer"></span>
+            <span class="hint">保真最大通道差 ${st.maxChannelDiff === 0 ? "0" : st.maxChannelDiff.toExponential(1)}（≤1e-9）；关系 ${st.relationCount} 条</span>
+          </div>
+          <div class="chain-step-order">
+            <span class="hint">步后叠序：</span>
+            <span class="checker"><span class="order-chips">
+              <span class="order-ends">底</span>${renderChainOrderChips(st.order, snaps[st.step].byId)}<span class="order-ends">↑ 顶</span>
+            </span></span>
+          </div>
+        </div>`;
+    })
+    .join("");
+
+  const finalSnap = snaps[snaps.length - 1];
+  const finalChips = renderChainOrderChips(plan.order, finalSnap.byId);
+  const fresh = chainPlanFresh();
+  elChainResult.innerHTML = `
+    <div class="merge-plan">
+      <div class="suggest-sec-title">
+        待确认校准链方案（共 ${plan.stepCount} 步；只在副本上试算、不自动修改；
+        全部步骤成功后才可整批确认）
+      </div>
+      ${blocks}
+      <div class="chain-final">
+        <div class="suggest-sec-title">最终输入（确认后一次性写回并重新求解；中间试算结果不会写入）</div>
+        <div class="merge-plan-row hint">最终图层 ${plan.layers.length} 个；样本 ${plan.samples.length} 组；关系 ${plan.relations.length} 条</div>
+        <div class="merge-plan-row">
+          <span class="hint">最终底 → 顶顺序（沿各步顺序带出，不重新择序）：</span>
+          <span class="checker"><span class="order-chips">
+            <span class="order-ends">底</span>${finalChips}<span class="order-ends">↑ 顶</span>
+          </span></span>
+        </div>
+      </div>
+      <div class="infer-actions">
+        <button class="btn btn-small" data-act="chain-confirm" type="button"
+                ${fresh && !chainChannel.isBusy() ? "" : "disabled"}>确认校准链并整批写回后重新求解</button>
+        <span class="hint">只写回最终图层 / 样本 / 关系；旧调序执行立即终止（已确认记录保留）；同一方案不能重复确认</span>
+      </div>
+    </div>
+  `;
+  if (!fresh || chainChannel.isBusy()) markChainStaleness();
+}
+
+function confirmChainPlan() {
+  const plan = chainState.plan;
+  // 确认前再次核对资格：方案失效（参与输入曾变化，即使改回原值）或仍在试算时不改任何输入
+  if (!plan || !chainPlanFresh() || chainChannel.isBusy()) return;
+  // 一次性写回最终输入：只写最终输入，任何中间试算结果都不作为其他功能的有效结果
+  state.layers = plan.layers.map((l) => ({ id: l.id, color: l.color, opacity: l.opacity }));
+  state.samples = plan.samples.map((s) => ({ background: s.background, target: s.target }));
+  state.relations = plan.relations.map((r) => ({ lower: r.lower, upper: r.upper }));
+  // 方案一经确认即消费：清空，不能使用同一方案再次写回
+  chainState.plan = null;
+  chainState.planKey = "";
+  chainState.invalidated = false;
+  elChainResult.innerHTML = "";
+  elChainErrors.hidden = true;
+  // 沿用输入变更流程：旧计算与调序执行失效（已确认记录保留、输入不回滚）、重新求解。
+  // 步骤编辑区保留当前步骤配置（图层集合可能已变，失效选项由服务端在再次试算时报错）。
+  render();
+  noteSolveInputChanged();
+  markCycleStaleness();
+  markInferStaleness();
+  markSuggestStaleness();
+  renderSuggestControls();
+  markReviewStaleness();
+  markTransitionStaleness();
+  markExtractStaleness();
+  markMergeStaleness();
+  markChainStaleness();
+  runSolve();
+}
 
 const transitionState = {
   order: [],        // 当前实际底→顶顺序（ID 数组）
@@ -2743,6 +3266,7 @@ async function confirmCyclePlan() {
     markReviewStaleness();
     markTransitionStaleness();
     markMergeStaleness();
+    markChainStaleness();
     clearCyclePlan();
     showErrors([]);
     lastSolveResult = data;
@@ -3546,6 +4070,7 @@ function appendExtractedSamples() {
   markReviewStaleness();
   markTransitionStaleness();
   markMergeStaleness();
+  markChainStaleness();
   runSolve();
 }
 

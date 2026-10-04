@@ -23,6 +23,10 @@
   上层 ID 改为下层 ID，两层间关系移除，重复对保留首次出现者）；线性光
   "over" 下同色相邻两层与单层严格等价，合并前后各样本未取整预测 RGB
   各通道相差不超过 1e-9
+- 校准处理链：在输入副本上依次执行 1～4 步不透明度反推或相邻同色合并，
+  各步沿用原网格反推与合并计算、校验规则；后一步使用前一步的新参数、
+  图层、关系和顺序，不重新择序；合并删去的 ID 后续再引用按当时图层集合
+  报错，不自动改指向保留层；全部成功才返回每步变更、最终输入与顺序
 """
 
 from __future__ import annotations
@@ -50,6 +54,8 @@ MAX_SUGGEST_ORDERS = 12
 MAX_REVIEW_ORDERS = 12
 MIN_PICK_POINTS = 1
 MAX_PICK_POINTS = 4
+MIN_CHAIN_STEPS = 1
+MAX_CHAIN_STEPS = 4
 
 class CalibrationError(Exception):
     """输入校验失败，errors 为可直接展示给用户的中文错误列表。"""
@@ -1691,3 +1697,280 @@ def fmt_num(v: float) -> str:
     if r == int(r):
         return str(int(r))
     return f"{r:.6g}"
+
+
+# --------------------------------------------------------- 校准处理链（反推 / 同色合并） --
+
+
+def _parse_chain_order(
+    raw_order: Any, parsed: _Parsed, errors: list[dict[str, Any]]
+) -> list[str] | None:
+    """校验校准链初始底→顶顺序：恰好包含全部图层 ID 各一次。
+
+    校验口径与 infer_opacities / merge_layers 的 order 完全一致（同样的中文
+    错误文本，scope 为 order）；顺序与先后关系的一致性在结构校验通过后统一
+    复用 _raise_if_cycle 的口径按当前关系判定。成功返回已去空白的 ID 序列。
+    """
+    n = len(parsed.ids)
+    id_set = {lid for lid in parsed.ids if lid}
+    order_ids: list[str] = []
+    ok = True
+    if not isinstance(raw_order, list):
+        errors.append(
+            _err("order", "缺少 order 列表或其格式不正确：必须按底→顶顺序给出全部图层 ID")
+        )
+        return None
+    if len(raw_order) != n:
+        errors.append(
+            _err("order", f"order 必须恰好包含全部 {n} 个图层 ID（各一次），当前 {len(raw_order)} 个")
+        )
+        ok = False
+    seen_order: set[str] = set()
+    for x in raw_order:
+        if not isinstance(x, str) or not x.strip():
+            errors.append(_err("order", f"order 中的图层 ID 非法：{x!r}（必须是已存在的图层 ID）"))
+            ok = False
+            continue
+        x = x.strip()
+        if x not in id_set:
+            errors.append(_err("order", f"order 中的图层 ID 不存在：{x!r}"))
+            ok = False
+        elif x in seen_order:
+            errors.append(
+                _err("order", f"order 中图层 ID 重复：{x}，每个图层必须且只能出现一次")
+            )
+            ok = False
+        else:
+            seen_order.add(x)
+        order_ids.append(x)
+    return order_ids if ok else None
+
+
+def _parse_chain_steps(
+    raw_steps: Any, errors: list[dict[str, Any]]
+) -> list[dict[str, Any]] | None:
+    """结构校验校准链步骤：1～4 步，每步为 infer 或 merge 对象。
+
+    只做与「后续步骤会删 ID」无关的结构性检查（步数、类型、字段是否为字符串、
+    同一步内 ID 是否重复、待调 ID 数量）；ID 是否存在、待合并两层是否相邻同色、
+    合并后层数等依赖当前副本状态的规则在逐步执行时由 infer_opacities /
+    merge_layers 原样校验——这样「合并删去的 ID 在后续步骤再次引用」必然按
+    执行当时的图层集合报错，且不会被自动改指向保留层。返回规整后的步骤：
+    infer 为 {"type": "infer", "adjustIds": [...原样顺序...]}（执行网格仍按
+    ID 字典序排列决胜），merge 为 {"type": "merge", "lowerId", "upperId"}。
+    """
+    if not isinstance(raw_steps, list):
+        errors.append(
+            _err("chain", f"缺少 steps 列表或其格式不正确：必须是 {MIN_CHAIN_STEPS}～{MAX_CHAIN_STEPS} 个校准步骤")
+        )
+        return None
+    if not (MIN_CHAIN_STEPS <= len(raw_steps) <= MAX_CHAIN_STEPS):
+        errors.append(
+            _err(
+                "chain",
+                f"校准步骤必须为 {MIN_CHAIN_STEPS}～{MAX_CHAIN_STEPS} 步，当前 {len(raw_steps)} 步",
+            )
+        )
+        return None
+
+    steps_out: list[dict[str, Any]] = []
+    for i, item in enumerate(raw_steps):
+        prefix = f"第 {i + 1} 步："
+        if not isinstance(item, dict):
+            errors.append(_err("chain", prefix + "步骤数据格式不正确，应为对象", i))
+            continue
+        step_type = item.get("type")
+        if step_type not in ("infer", "merge"):
+            errors.append(
+                _err(
+                    "chain",
+                    prefix + f"步骤类型非法：{step_type!r}，必须是 \"infer\"（不透明度反推）或 \"merge\"（相邻同色合并）",
+                    i,
+                )
+            )
+            continue
+        if step_type == "infer":
+            raw_adjust = item.get("adjustIds")
+            adjust: list[str] = []
+            if not isinstance(raw_adjust, list):
+                errors.append(
+                    _err("chain", prefix + "缺少 adjustIds 列表或其格式不正确：必须选择 1～2 个待反推图层 ID", i)
+                )
+            else:
+                if not (MIN_ADJUST <= len(raw_adjust) <= MAX_ADJUST):
+                    errors.append(
+                        _err(
+                            "chain",
+                            prefix + f"待调图层必须为 {MIN_ADJUST}～{MAX_ADJUST} 个，当前 {len(raw_adjust)} 个",
+                            i,
+                        )
+                    )
+                seen_adjust: set[str] = set()
+                for x in raw_adjust:
+                    if not isinstance(x, str) or not x.strip():
+                        errors.append(_err("chain", prefix + f"待调图层 ID 非法：{x!r}", i))
+                        continue
+                    x = x.strip()
+                    if x in seen_adjust:
+                        errors.append(
+                            _err("chain", prefix + f"待调图层 ID 重复：{x}，同一图层只能选择一次", i)
+                        )
+                        continue
+                    seen_adjust.add(x)
+                    adjust.append(x)
+            steps_out.append({"type": "infer", "adjustIds": adjust})
+        else:
+            raw_lower = item.get("lowerId")
+            raw_upper = item.get("upperId")
+            lower_id = raw_lower.strip() if isinstance(raw_lower, str) else ""
+            upper_id = raw_upper.strip() if isinstance(raw_upper, str) else ""
+            if not lower_id:
+                errors.append(_err("chain", prefix + f"待合并的下层图层 ID 非法：{raw_lower!r}", i))
+            if not upper_id:
+                errors.append(_err("chain", prefix + f"待合并的上层图层 ID 非法：{raw_upper!r}", i))
+            if lower_id and upper_id and lower_id == upper_id:
+                errors.append(_err("chain", prefix + f"待合并的两层不能是同一图层：{lower_id}", i))
+            steps_out.append({"type": "merge", "lowerId": lower_id, "upperId": upper_id})
+    return steps_out
+
+
+def _with_step_prefix(exc: CalibrationError, step_no: int) -> CalibrationError:
+    """把逐步执行时底层校验错误统一加上「第 N 步：」前缀，并附 0 起步号 index。"""
+    prefixed = [
+        {**e, "message": f"第 {step_no} 步：{e['message']}", "index": step_no - 1}
+        for e in exc.errors
+    ]
+    return CalibrationError(prefixed)
+
+
+def calibrate_chain(payload: Any) -> dict[str, Any]:
+    """在输入副本上依次执行 1～4 步「不透明度反推 / 相邻同色合并」校准链。
+
+    初始 order 必须是当前输入的完整合法底→顶顺序（恰好包含全部图层 ID 各一次
+    且符合全部先后关系）。各步沿用原反推网格（0.00～1.00、步长 0.01，原始参数组
+    在网格外时额外纳入，按待调参数元组决胜）与原合并计算 / 校验规则
+    （infer_opacities / merge_layers），在副本上逐步执行：后一步直接使用前一步
+    返回的新图层、关系与顺序，不重新择序。合并删去的 ID 若在后续步骤再次引用，
+    按当时副本的图层集合报错，绝不自动改指向保留层。任何一步失败都抛出带
+    「第 N 步：」前缀的 CalibrationError，不返回可确认方案；全部成功时返回
+    每步变更、最终输入（layers / samples / relations）与最终 order。
+    整个过程不改动调用方传入的输入。
+    """
+    parsed, errors = _parse_inputs(payload)
+    assert isinstance(payload, dict)  # _parse_inputs 已保证是 dict
+
+    order_ids = _parse_chain_order(payload.get("order"), parsed, errors)
+    steps = _parse_chain_steps(payload.get("steps"), errors)
+    if errors:
+        raise CalibrationError(errors)
+    assert order_ids is not None and steps is not None
+    _raise_if_cycle(parsed)
+
+    # 当前副本（图层 / 样本 / 关系均已规范化）与当前底→顶顺序；
+    # 初始顺序还须符合全部先后关系，口径与 infer_opacities / merge_layers 一致。
+    current_layers: list[dict[str, Any]] = [
+        {"id": parsed.ids[i], "color": parsed.hexes[i], "opacity": parsed.alphas[i]}
+        for i in range(len(parsed.ids))
+    ]
+    current_samples: list[dict[str, Any]] = [
+        {"background": parsed.bg_hex[s], "target": parsed.tg_hex[s]}
+        for s in range(len(parsed.bg_hex))
+    ]
+    current_relations: list[dict[str, str]] = [
+        {"lower": parsed.ids[li], "upper": parsed.ids[ui]} for li, ui in parsed.pairs
+    ]
+    current_order = list(order_ids)
+
+    # 初始顺序与先后关系一致性（infer_opacities 内的同一检查，先于首步执行）
+    n = len(parsed.ids)
+    pos = [0] * n
+    for p, idx in enumerate([parsed.seen_ids[x] for x in current_order]):
+        pos[idx] = p
+    for li, ui in parsed.pairs:
+        if pos[li] >= pos[ui]:
+            raise CalibrationError(
+                [
+                    _err(
+                        "order",
+                        f"所给顺序不符合先后关系：{parsed.ids[li]} 必须在 {parsed.ids[ui]} 下方（底 → 顶）",
+                    )
+                ]
+            )
+
+    step_results: list[dict[str, Any]] = []
+    for step_no, spec in enumerate(steps, start=1):
+        if spec["type"] == "infer":
+            step_payload = {
+                "layers": current_layers,
+                "samples": current_samples,
+                "relations": current_relations,
+                "order": current_order,
+                "adjustIds": spec["adjustIds"],
+            }
+            try:
+                r = infer_opacities(step_payload)
+            except CalibrationError as exc:
+                raise _with_step_prefix(exc, step_no) from None
+            # 把建议不透明度写回副本图层；顺序、关系、样本均不变（不重新择序）
+            suggested = {a["id"]: a["suggestedOpacity"] for a in r["adjustments"]}
+            for layer in current_layers:
+                if layer["id"] in suggested:
+                    layer["opacity"] = suggested[layer["id"]]
+            step_results.append(
+                {
+                    "step": step_no,
+                    "type": "infer",
+                    "adjustIds": list(r["adjustIds"]),
+                    "adjustments": r["adjustments"],
+                    "beforeTotalSse": r["beforeTotalSse"],
+                    "afterTotalSse": r["afterTotalSse"],
+                    "combosChecked": r["combosChecked"],
+                    "order": list(r["order"]),
+                }
+            )
+        else:
+            step_payload = {
+                "layers": current_layers,
+                "samples": current_samples,
+                "relations": current_relations,
+                "order": current_order,
+                "lowerId": spec["lowerId"],
+                "upperId": spec["upperId"],
+            }
+            try:
+                r = merge_layers(step_payload)
+            except CalibrationError as exc:
+                raise _with_step_prefix(exc, step_no) from None
+            # 以合并返回的新输入作为下一步的副本；顺序即原顺序删去上层
+            current_layers = [
+                {"id": l["id"], "color": l["color"], "opacity": l["opacity"]}
+                for l in r["layers"]
+            ]
+            current_relations = [
+                {"lower": rel["lower"], "upper": rel["upper"]} for rel in r["relations"]
+            ]
+            current_samples = [
+                {"background": s["background"], "target": s["target"]} for s in r["samples"]
+            ]
+            current_order = list(r["order"])
+            step_results.append(
+                {
+                    "step": step_no,
+                    "type": "merge",
+                    "mergedLayer": r["mergedLayer"],
+                    "removedLayer": r["removedLayer"],
+                    "maxChannelDiff": r["maxChannelDiff"],
+                    "order": list(r["order"]),
+                    "relationCount": len(current_relations),
+                }
+            )
+
+    return {
+        "initialOrder": list(order_ids),
+        "steps": step_results,
+        "stepCount": len(step_results),
+        "layers": current_layers,
+        "samples": current_samples,
+        "relations": current_relations,
+        "order": current_order,
+    }

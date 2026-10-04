@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from .composite import MAX_IMAGE_BYTES, composite_preview, parse_payload_field
 from .core import (
     CalibrationError,
+    calibrate_chain,
     confirm_cycle_resolution,
     infer_opacities,
     merge_layers,
@@ -23,7 +24,7 @@ from .core import (
     suggest_background,
 )
 from .extract import extract_sample_pairs
-app = FastAPI(title="透明图层叠序校准台", version="1.8.0")
+app = FastAPI(title="透明图层叠序校准台", version="1.9.0")
 
 
 @app.get("/api/health")
@@ -266,6 +267,26 @@ async def api_merge_layers(request: Request) -> JSONResponse:
         )
     try:
         result = merge_layers(payload)
+    except CalibrationError as exc:
+        return JSONResponse(status_code=400, content={"errors": exc.errors})
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/calibration-chain")
+async def api_calibration_chain(request: Request) -> JSONResponse:
+    """接收校准输入、完整合法初始顺序与 1～4 步步骤（infer 反推 / merge 合并），
+    在副本上沿用原网格反推与合并计算、校验规则依次执行；后一步使用前一步的
+    新参数、图层、关系和顺序，不重新择序。任何一步失败均为 400 JSON（错误
+    消息带「第 N 步：」前缀），不返回可确认方案，且不改动任何输入。"""
+    try:
+        payload: Any = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "form", "message": "请求体不是合法的 JSON"}]},
+        )
+    try:
+        result = calibrate_chain(payload)
     except CalibrationError as exc:
         return JSONResponse(status_code=400, content={"errors": exc.errors})
     return JSONResponse(status_code=200, content=result)

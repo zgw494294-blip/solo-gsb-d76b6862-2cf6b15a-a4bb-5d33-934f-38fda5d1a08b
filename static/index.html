@@ -296,6 +296,36 @@
           <div id="mergeResult"></div>
         </div>
       </div>
+      <!-- 校准处理链（反推 + 同色合并，整批试算后一次确认） -->
+      <div class="card chain-card" id="chainCard" hidden>
+        <div class="card-head">
+          <h2>校准处理链 <span class="hint">（1～4 步：不透明度反推 / 相邻同色合并，在副本上依次执行，全部成功后整批确认）</span></h2>
+          <span id="chainStatus" class="status"></span>
+        </div>
+        <div id="chainBody">
+          <div class="infer-field">
+            <div class="infer-field-label">
+              当前有效求解顺序（底 → 顶，只读；每步在此顺序及其后续新顺序上执行，不重新择序）
+            </div>
+            <div id="chainOrder" class="infer-order"></div>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">
+              校准步骤（1～4 步，按序执行）
+              <button id="chainAddBtn" class="btn btn-ghost btn-small" data-act="chain-add"
+                      type="button">＋ 添加步骤</button>
+            </div>
+            <div id="chainSteps" class="chain-steps"></div>
+          </div>
+          <div class="infer-actions">
+            <button id="chainRunBtn" class="btn btn-small" data-act="chain-run"
+                    type="button">整批试算</button>
+            <span id="chainHint" class="hint">在副本上逐步执行；任何一步失败都不返回可确认方案，原输入始终不变</span>
+          </div>
+          <div id="chainErrors" class="infer-errors" hidden></div>
+          <div id="chainResult"></div>
+        </div>
+      </div>
     </section>
   </main>
 

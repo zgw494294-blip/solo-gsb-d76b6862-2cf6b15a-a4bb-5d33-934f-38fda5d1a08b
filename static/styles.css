@@ -639,6 +639,89 @@ a.btn.composite-download.is-disabled {
   flex: none;
 }
 
+/* ------------------------- 校准处理链（反推 + 同色合并） ------------------------- */
+.chain-card { margin-top: 16px; }
+.chain-steps { display: flex; flex-direction: column; gap: 8px; }
+.chain-step-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #fbfcfe;
+}
+.chain-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.chain-step-tag {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  background: #eef1f8;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 10px;
+  white-space: nowrap;
+}
+.chain-step-head select {
+  font-size: 12px;
+  padding: 3px 6px;
+}
+.chain-step-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.chain-step-kind {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.chain-id-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+.chain-id-pick select {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  padding: 3px 6px;
+  min-width: 62px;
+}
+.chain-step-result {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 8px 0;
+  background: #fbfcfe;
+}
+.chain-step-result-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.chain-step-result-head .mini-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  display: inline-block;
+}
+.chain-step-order { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.chain-final {
+  border-top: 1px dashed var(--line);
+  margin-top: 10px;
+  padding-top: 8px;
+}
+
 /* ------------------------- 过渡步骤规划 ------------------------- */
 .transition-card { margin-top: 16px; }
 #transitionLimit { width: 150px; margin-right: 8px; }
