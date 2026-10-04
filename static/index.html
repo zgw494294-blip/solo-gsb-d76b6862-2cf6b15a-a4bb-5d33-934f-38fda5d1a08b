@@ -296,6 +296,38 @@
           <div id="mergeResult"></div>
         </div>
       </div>
+
+      <!-- 校准处理链（反推 + 同色合并，整批确认） -->
+      <div class="card chain-card" id="chainCard" hidden>
+        <div class="card-head">
+          <h2>校准处理链 <span class="hint">（反推与相邻同色合并串成 1～4 步，全部成功后一次性写回）</span></h2>
+          <span id="chainStatus" class="status"></span>
+        </div>
+        <div id="chainBody">
+          <div class="infer-field">
+            <div class="infer-field-label">
+              固定起点顺序（当前有效求解顺序，底 → 顶；处理链不重新择序，后续步骤在此顺序及其演变上执行）
+            </div>
+            <div id="chainOrder" class="infer-order"></div>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">
+              校准步骤（1～4 步，依次执行；后一步使用前一步的新参数、图层、关系与顺序；
+              被合并删除的 ID 不能再引用）
+              <button id="addChainStepBtn" class="btn btn-ghost btn-small" data-act="chain-step-add"
+                      type="button">＋ 添加步骤</button>
+            </div>
+            <div id="chainSteps" class="chain-steps"></div>
+          </div>
+          <div class="infer-actions">
+            <button id="chainRunBtn" class="btn btn-small" data-act="chain-run"
+                    type="button">试算处理链</button>
+            <span id="chainHint" class="hint">沿用当前有效求解顺序</span>
+          </div>
+          <div id="chainErrors" class="infer-errors" hidden></div>
+          <div id="chainResult"></div>
+        </div>
+      </div>
     </section>
   </main>
 

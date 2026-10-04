@@ -1,9 +1,10 @@
 /* 共享请求通道（RequestChannel）——不依赖 DOM 的纯前端控制模块。
  *
- * 供三条请求路径共用：
- *   - 原求解      POST /api/solve            （归属键＝只增不减的求解输入纪元）
- *   - 不透明度反推 POST /api/infer-opacity     （归属键＝参与输入指纹）
- *   - 相邻同色合并 POST /api/merge-layers    （归属键＝参与输入指纹）
+ * 供四条请求路径共用：
+ *   - 原求解       POST /api/solve               （归属键＝只增不减的求解输入纪元）
+ *   - 不透明度反推 POST /api/infer-opacity          （归属键＝参与输入指纹）
+ *   - 相邻同色合并 POST /api/merge-layers         （归属键＝参与输入指纹）
+ *   - 校准处理链   POST /api/calibration-chain    （归属键＝参与输入指纹）
  *
  * 统一收敛三处重复的「请求登记、归属检查与加载收尾」：
  *   - 请求登记 begin：从永不归零的单调计数器取得请求序号（请求以任何方式结束后

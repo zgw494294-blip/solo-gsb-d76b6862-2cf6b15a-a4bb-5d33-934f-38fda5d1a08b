@@ -1034,3 +1034,62 @@ a.btn.composite-download.is-disabled {
 }
 .diag-sample-row .hint b { color: var(--ink); font-weight: 600; }
 .diag-sample-tag { color: var(--ink-soft); }
+
+/* ------------------------- 校准处理链（反推 + 同色合并） ------------------------- */
+.chain-card { margin-top: 16px; }
+.chain-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.chain-step-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #fbfcfe;
+}
+.chain-step-no {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--ink-soft);
+  padding-top: 6px;
+  white-space: nowrap;
+}
+.chain-step-type select {
+  font-size: 12px;
+  padding: 4px 6px;
+  margin-top: 2px;
+}
+.chain-step-body {
+  flex: 1 1 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 260px;
+}
+.chain-step-kind {
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.chain-step-row .btn-small { margin-top: 2px; }
+.chain-step-results {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 8px 0;
+}
+.chain-step-result {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #fff;
+}
+.chain-final {
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+  margin-top: 8px;
+}

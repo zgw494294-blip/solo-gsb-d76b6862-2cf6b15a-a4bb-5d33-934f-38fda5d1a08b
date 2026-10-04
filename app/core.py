@@ -23,6 +23,11 @@
   上层 ID 改为下层 ID，两层间关系移除，重复对保留首次出现者）；线性光
   "over" 下同色相邻两层与单层严格等价，合并前后各样本未取整预测 RGB
   各通道相差不超过 1e-9
+- 校准处理链：以一条完整合法的底→顶顺序为起点，录入 1～4 步，每步为
+  1～2 个图层的不透明度反推或相邻两层同色合并；在副本上依次执行，后一步
+  使用前一步产生的新参数、图层、关系与顺序（不重新择序），任一步失败即
+  整体拒绝并注明步号；被合并删除的 ID 后续再引用一律报错，不自动改指向
+  保留层；全部成功后返回每步变更与最终输入，供客户端一次性写回
 """
 
 from __future__ import annotations
@@ -50,6 +55,8 @@ MAX_SUGGEST_ORDERS = 12
 MAX_REVIEW_ORDERS = 12
 MIN_PICK_POINTS = 1
 MAX_PICK_POINTS = 4
+MIN_CHAIN_STEPS = 1
+MAX_CHAIN_STEPS = 4
 
 class CalibrationError(Exception):
     """输入校验失败，errors 为可直接展示给用户的中文错误列表。"""
@@ -1682,6 +1689,275 @@ def merge_layers(payload: Any) -> dict[str, Any]:
         "mergedLayer": {"id": lower_id, "color": parsed.hexes[li_idx], "opacity": merged_alpha},
         "removedLayer": {"id": upper_id, "color": parsed.hexes[ui_idx], "opacity": a_upper},
         "maxChannelDiff": max_diff,
+    }
+
+
+# --------------------------------------------------------- 校准处理链（反推 + 合并） --
+
+
+def _chain_payload(
+    layers: list[dict[str, Any]],
+    samples: list[dict[str, Any]],
+    relations: list[dict[str, str]],
+    order: list[str],
+) -> dict[str, Any]:
+    """组装处理链某一步的子请求：当前副本输入 + 该步仍在使用的底→顶顺序。"""
+    return {
+        "layers": layers,
+        "samples": samples,
+        "relations": relations,
+        "order": order,
+    }
+
+
+def _chain_total_sse(
+    layers: list[dict[str, Any]],
+    samples: list[dict[str, Any]],
+    relations: list[dict[str, str]],
+    order: list[str],
+) -> tuple[float, Any]:
+    """按当前副本输入解析并计算给定顺序的总平方误差；新输入由合法输入逐步
+    构造，结构必然合法，若仍有字段错误说明处理链实现出错（断言兜底）。"""
+    parsed, perr = _parse_inputs(
+        {"layers": layers, "samples": samples, "relations": relations}
+    )
+    assert not perr
+    order_idx = [parsed.seen_ids[x] for x in order]
+    samples_detail, total = _sample_details(parsed, order_idx, parsed.alphas)
+    return total, (parsed, order_idx, samples_detail)
+
+
+def _with_step_index(err: CalibrationError, step_no: int) -> CalibrationError:
+    """给子步错误统一补上 1 基步号（merge_layers 等原有错误本身不带步号）。"""
+    for e in err.errors:
+        e["step"] = step_no
+    return err
+
+
+def calibration_chain(payload: Any) -> dict[str, Any]:
+    """在副本上依次执行 1～4 步校准（不透明度反推 / 相邻同色合并）。
+
+    起点为请求给定的完整合法底→顶顺序（恰好包含全部图层 ID 各一次并满足
+    全部先后关系）；每一步的计算完全沿用 infer_opacities 的 0.00～1.00
+    （步长 0.01）联合反推网格与 merge_layers 的相邻同色合并、关系改写与
+    校验规则。后一步使用前一步的新参数、图层、关系与顺序，不重新择序。
+    被合并删除的 ID 在后续步骤中再引用时由子步校验直接报「ID 不存在」，
+    不自动改指向保留层。任一步失败均抛带步号（step，1 基）的
+    CalibrationError，不返回任何可确认方案；本函数不改动请求输入。
+    """
+    parsed, errors = _parse_inputs(payload)
+    assert isinstance(payload, dict)  # _parse_inputs 已保证是 dict
+
+    n = len(parsed.ids)
+    id_set = {lid for lid in parsed.ids if lid}
+
+    # ---- 起点顺序：与 infer_opacities / merge_layers 同一校验口径 -----------
+    raw_order = payload.get("order")
+    order_ids: list[str] = []
+    if not isinstance(raw_order, list):
+        errors.append(
+            _err("order", "缺少 order 列表或其格式不正确：必须按底→顶顺序给出全部图层 ID")
+        )
+    else:
+        if len(raw_order) != n:
+            errors.append(
+                _err("order", f"order 必须恰好包含全部 {n} 个图层 ID（各一次），当前 {len(raw_order)} 个")
+            )
+        seen_order: set[str] = set()
+        for x in raw_order:
+            if not isinstance(x, str) or not x.strip():
+                errors.append(_err("order", f"order 中的图层 ID 非法：{x!r}（必须是已存在的图层 ID）"))
+                continue
+            x = x.strip()
+            if x not in id_set:
+                errors.append(_err("order", f"order 中的图层 ID 不存在：{x!r}"))
+            elif x in seen_order:
+                errors.append(_err("order", f"order 中图层 ID 重复：{x}，每个图层必须且只能出现一次"))
+            else:
+                seen_order.add(x)
+            order_ids.append(x)
+
+    # ---- 步骤列表的结构校验（字段级语义校验随各子步执行时进行）--------------
+    raw_steps = payload.get("steps")
+    steps_ok = isinstance(raw_steps, list)
+    if not steps_ok:
+        errors.append(
+            _err("chain", "缺少 steps 列表或其格式不正确：应为 1～4 个校准步骤组成的数组")
+        )
+    elif not (MIN_CHAIN_STEPS <= len(raw_steps) <= MAX_CHAIN_STEPS):
+        errors.append(
+            _err(
+                "chain",
+                f"校准步骤必须为 {MIN_CHAIN_STEPS}～{MAX_CHAIN_STEPS} 步，当前 {len(raw_steps)} 步",
+            )
+        )
+
+    if errors:
+        raise CalibrationError(errors)
+    _raise_if_cycle(parsed)
+
+    # ---- 起点顺序必须符合先后关系 ------------------------------------------
+    order_idx0 = [parsed.seen_ids[x] for x in order_ids]
+    pos = [0] * n
+    for p, idx in enumerate(order_idx0):
+        pos[idx] = p
+    for li, ui in parsed.pairs:
+        if pos[li] >= pos[ui]:
+            raise CalibrationError(
+                [
+                    _err(
+                        "order",
+                        f"所给顺序不符合先后关系：{parsed.ids[li]} 必须在 {parsed.ids[ui]} 下方（底 → 顶）",
+                    )
+                ]
+            )
+
+    # ---- 工作副本（规范化后的图层 / 样本 / 关系；样本全程不变）--------------
+    cur_layers: list[dict[str, Any]] = [
+        {"id": parsed.ids[i], "color": parsed.hexes[i], "opacity": parsed.alphas[i]}
+        for i in range(n)
+    ]
+    cur_samples: list[dict[str, Any]] = [
+        {"background": parsed.bg_hex[s], "target": parsed.tg_hex[s]}
+        for s in range(len(parsed.bg_hex))
+    ]
+    cur_relations: list[dict[str, str]] = [
+        {"lower": parsed.ids[li], "upper": parsed.ids[ui]} for li, ui in parsed.pairs
+    ]
+    cur_order: list[str] = list(order_ids)
+
+    initial_total, _ = _chain_total_sse(cur_layers, cur_samples, cur_relations, cur_order)
+
+    step_results: list[dict[str, Any]] = []
+    for step_no, raw_step in enumerate(raw_steps, start=1):
+        if not isinstance(raw_step, dict):
+            raise CalibrationError(
+                [
+                    _err("chain", "该步骤格式不正确：每一步必须是对象")
+                    | {"step": step_no}
+                ]
+            )
+        step_type = raw_step.get("type")
+        if step_type not in ("infer", "merge"):
+            raise CalibrationError(
+                [
+                    _err(
+                        "chain",
+                        f"type 非法：{step_type!r}，"
+                        "只支持 'infer'（不透明度反推）或 'merge'（相邻同色合并）",
+                    )
+                    | {"step": step_no}
+                ]
+            )
+
+        before_total, _ = _chain_total_sse(
+            cur_layers, cur_samples, cur_relations, cur_order
+        )
+
+        if step_type == "infer":
+            adjust = raw_step.get("adjustIds")
+            if not isinstance(adjust, list):
+                raise CalibrationError(
+                    [
+                        _err(
+                            "chain",
+                            "不透明度反推步缺少 adjustIds 列表：必须指定 1～2 个待调图层 ID",
+                        )
+                        | {"step": step_no}
+                    ]
+                )
+            try:
+                r = infer_opacities(
+                    {**_chain_payload(cur_layers, cur_samples, cur_relations, cur_order),
+                     "adjustIds": adjust}
+                )
+            except CalibrationError as exc:
+                raise _with_step_index(exc, step_no) from None
+            # 子步已用同一份副本校验：按 ID 写回建议不透明度（不重新择序）
+            suggested = {a["id"]: a["suggestedOpacity"] for a in r["adjustments"]}
+            for layer in cur_layers:
+                if layer["id"] in suggested:
+                    layer["opacity"] = suggested[layer["id"]]
+            after_total, _ = _chain_total_sse(
+                cur_layers, cur_samples, cur_relations, cur_order
+            )
+            step_results.append(
+                {
+                    "step": step_no,
+                    "type": "infer",
+                    "adjustIds": r["adjustIds"],
+                    "adjustments": r["adjustments"],
+                    "beforeTotalSse": r["beforeTotalSse"],
+                    "afterTotalSse": r["afterTotalSse"],
+                    "combosChecked": r["combosChecked"],
+                    "opacityGrid": r["opacityGrid"],
+                    "layers": [dict(l) for l in cur_layers],
+                    "order": list(cur_order),
+                    "relations": [dict(x) for x in cur_relations],
+                }
+            )
+            # before_total 必须与子步返回的调整前总误差逐位一致（同一副本口径）
+            assert abs(before_total - r["beforeTotalSse"]) < 1e-9
+            assert abs(after_total - r["afterTotalSse"]) < 1e-9
+        else:
+            lower = raw_step.get("lowerId")
+            upper = raw_step.get("upperId")
+            if not isinstance(lower, str) or not isinstance(upper, str):
+                raise CalibrationError(
+                    [
+                        _err(
+                            "chain",
+                            "相邻同色合并步必须以字符串指定 lowerId 与 upperId",
+                        )
+                        | {"step": step_no}
+                    ]
+                )
+            try:
+                r = merge_layers(
+                    {**_chain_payload(cur_layers, cur_samples, cur_relations, cur_order),
+                     "lowerId": lower,
+                     "upperId": upper}
+                )
+            except CalibrationError as exc:
+                raise _with_step_index(exc, step_no) from None
+            cur_layers = [dict(l) for l in r["layers"]]
+            cur_relations = [dict(x) for x in r["relations"]]
+            cur_order = list(r["order"])
+            after_total, _ = _chain_total_sse(
+                cur_layers, cur_samples, cur_relations, cur_order
+            )
+            step_results.append(
+                {
+                    "step": step_no,
+                    "type": "merge",
+                    "lowerId": r["mergedLayer"]["id"],
+                    "upperId": r["removedLayer"]["id"],
+                    "mergedLayer": r["mergedLayer"],
+                    "removedLayer": r["removedLayer"],
+                    "maxChannelDiff": r["maxChannelDiff"],
+                    "beforeTotalSse": before_total,
+                    "afterTotalSse": after_total,
+                    "layers": [dict(l) for l in cur_layers],
+                    "order": list(cur_order),
+                    "relations": [dict(x) for x in cur_relations],
+                }
+            )
+
+    final_total, (final_parsed, final_order_idx, final_samples_detail) = _chain_total_sse(
+        cur_layers, cur_samples, cur_relations, cur_order
+    )
+
+    return {
+        "initialOrder": list(order_ids),
+        "initialTotalSse": initial_total,
+        "steps": step_results,
+        "stepCount": len(step_results),
+        "finalLayers": cur_layers,
+        "finalSamples": cur_samples,
+        "finalRelations": cur_relations,
+        "finalOrder": cur_order,
+        "finalTotalSse": final_total,
+        "samples": final_samples_detail,
     }
 
 
